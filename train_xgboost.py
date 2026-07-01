@@ -23,7 +23,6 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -40,12 +39,13 @@ from feature_utils import (
     clean_text,
     extract_text_features,
     features_to_vector,
+    positive_prob,
 )
 
 # ── constants ────────────────────────────────────────────────────────────────
 BERT_PATH = "pitch_coach_model"
-ROOT_OUT = "pitch_coach_xgb.json"
-API_OUT = "api/pitch_coach_xgb.json"
+ROOT_OUT = "pitch_coach_xgb.json"        # native model, for the local Streamlit app
+TREES_OUT = "api/model_trees.json"       # tree dump, read by api/model_predict.py
 MAX_LEN = 512
 SEED = 42
 N_FOLDS = 5  # stratified k-fold cross-validation
@@ -53,6 +53,57 @@ N_FOLDS = 5  # stratified k-fold cross-validation
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ── pure-Python tree export ───────────────────────────────────────────────────
+def export_trees_json(clf, out_path: str) -> None:
+    """
+    Dump the fitted XGBoost model to a compact JSON the pure-Python evaluator
+    (api/model_predict.py) can walk without the xgboost library.
+
+    Format: {"base_margin": float, "trees": [{nodeid: node, ...}, ...]}
+    where each node is either {"leaf": v} or
+    {"f": feature_index, "thr": split, "yes": id, "no": id, "missing": id}.
+    """
+    import json
+    import math
+
+    booster = clf.get_booster()
+    booster.feature_names = None  # force split names to be "f<index>"
+    dumps = booster.get_dump(dump_format="json")
+
+    config = json.loads(booster.save_config())
+    # xgboost 3.x reports base_score as a bracketed vector string, e.g. "[4.8E-1]".
+    raw_bs = config["learner"]["learner_model_param"]["base_score"]
+    base_score = float(str(raw_bs).strip().lstrip("[").rstrip("]"))
+    # base_score lives in probability space for binary:logistic → convert to margin.
+    base_margin = math.log(base_score / (1.0 - base_score)) if 0 < base_score < 1 else 0.0
+
+    def parse(node: dict, out: dict) -> None:
+        nid = str(node["nodeid"])
+        if "leaf" in node:
+            out[nid] = {"leaf": node["leaf"]}
+        else:
+            split = node["split"]
+            fidx = int(split[1:]) if isinstance(split, str) and split[0] == "f" else int(split)
+            out[nid] = {
+                "f": fidx,
+                "thr": node["split_condition"],
+                "yes": node["yes"],
+                "no": node["no"],
+                "missing": node["missing"],
+            }
+            for child in node["children"]:
+                parse(child, out)
+
+    trees = []
+    for d in dumps:
+        nodes: dict = {}
+        parse(json.loads(d), nodes)
+        trees.append(nodes)
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(json.dumps({"base_margin": base_margin, "trees": trees}))
 
 
 # ── BERT embedding ────────────────────────────────────────────────────────────
@@ -146,16 +197,33 @@ def main() -> None:
     print("Fitting final model on all data …")
     clf = make_clf()
     clf.fit(X, y)
-    clf.get_booster().feature_names = feature_names  # readable names for SHAP
 
+    # Native model for the local Streamlit app (loaded via xgboost).
     clf.save_model(ROOT_OUT)
-    Path(API_OUT).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(ROOT_OUT, API_OUT)
-    print(f"Saved XGBoost model to '{ROOT_OUT}' and '{API_OUT}'.")
+    print(f"Saved native XGBoost model to '{ROOT_OUT}'.")
+
+    # Export the trees to JSON for the pure-Python evaluator (api/model_predict.py).
+    # This removes xgboost/scipy/numpy (~500 MB) from the Vercel deployment.
+    export_trees_json(clf, TREES_OUT)
+    print(f"Exported trees to '{TREES_OUT}'.")
+
+    # Sanity check: pure-Python evaluator must match xgboost's own probability.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "model_predict", "api/model_predict.py"
+    )
+    mp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mp)
+    x0 = X[0].tolist()
+    xgb_p = float(clf.predict_proba(X[:1])[0][1])
+    py_p = positive_prob(mp.score(x0))
+    print(f"Evaluator check — xgboost: {xgb_p:.4f}  pure-python: {py_p:.4f}  "
+          f"(Δ={abs(xgb_p - py_p):.2e})")
+
     print(
         "\nNext steps:\n"
         "  • Local:  streamlit run app.py\n"
-        "  • Vercel: redeploy — api/pitch_coach_xgb.json is bundled automatically."
+        "  • Vercel: commit api/model_trees.json and redeploy."
     )
 
 
