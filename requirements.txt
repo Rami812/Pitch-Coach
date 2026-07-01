@@ -1,6 +1,3 @@
-# Deployment (Vercel) dependencies ONLY — kept light so the serverless bundle
-# stays under Vercel's 250 MB compressed / 500 MB uncompressed limit.
-# Vercel installs THIS file. Heavy local-only deps live in requirements-local.txt.
 fastapi>=0.111.0
 openai>=1.30.0
 httpx>=0.27.0
