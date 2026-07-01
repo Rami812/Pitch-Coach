@@ -1,0 +1,11 @@
+{
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 60,
+      "includeFiles": "{feature_utils.py,gemini_utils.py,frontend.py,model_predict.py,model_trees.json}"
+    }
+  },
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
+  ]
+}

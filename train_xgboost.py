@@ -12,8 +12,8 @@ Run AFTER train_bert.py (which produces pitch_coach_model/):
     python train_xgboost.py
 
 Outputs:
-    pitch_coach_xgb.json       — XGBoost model (for the local Streamlit app)
-    api/pitch_coach_xgb.json   — copy bundled into the Vercel function
+    pitch_coach_xgb.json    — native XGBoost model (for the local Streamlit app)
+    model_trees.json        — tree dump read by the pure-Python evaluator on Vercel
 """
 
 import os
@@ -45,7 +45,7 @@ from feature_utils import (
 # ── constants ────────────────────────────────────────────────────────────────
 BERT_PATH = "pitch_coach_model"
 ROOT_OUT = "pitch_coach_xgb.json"        # native model, for the local Streamlit app
-TREES_OUT = "api/model_trees.json"       # tree dump, read by api/model_predict.py
+TREES_OUT = "model_trees.json"           # tree dump, read by model_predict.py (root)
 MAX_LEN = 512
 SEED = 42
 N_FOLDS = 5  # stratified k-fold cross-validation
@@ -59,7 +59,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def export_trees_json(clf, out_path: str) -> None:
     """
     Dump the fitted XGBoost model to a compact JSON the pure-Python evaluator
-    (api/model_predict.py) can walk without the xgboost library.
+    (model_predict.py) can walk without the xgboost library.
 
     Format: {"base_margin": float, "trees": [{nodeid: node, ...}, ...]}
     where each node is either {"leaf": v} or
@@ -76,7 +76,7 @@ def export_trees_json(clf, out_path: str) -> None:
     # xgboost 3.x reports base_score as a bracketed vector string, e.g. "[4.8E-1]".
     raw_bs = config["learner"]["learner_model_param"]["base_score"]
     base_score = float(str(raw_bs).strip().lstrip("[").rstrip("]"))
-    # base_score lives in probability space for binary:logistic → convert to margin.
+    # base_score is in probability space for binary:logistic → convert to margin.
     base_margin = math.log(base_score / (1.0 - base_score)) if 0 < base_score < 1 else 0.0
 
     def parse(node: dict, out: dict) -> None:
@@ -137,7 +137,6 @@ def main() -> None:
     df["text"] = df["Speech"].astype(str)
     y = (df["label"] == "good").astype(int).values  # 1=good, 0=bad
 
-    # Load DistilBERT as a *base* model (no classification head) for embeddings.
     print(f"Loading BERT from '{BERT_PATH}' …")
     tokenizer = AutoTokenizer.from_pretrained(BERT_PATH)
     bert = DistilBertModel.from_pretrained(BERT_PATH).to(device)
@@ -153,12 +152,9 @@ def main() -> None:
     )
 
     X = np.hstack([embeddings, ling]).astype("float32")
-    feature_names = [f"emb_{i}" for i in range(EMBEDDING_DIM)] + LINGUISTIC_FEATURE_NAMES
     print(f"Feature matrix: {X.shape}  ({EMBEDDING_DIM} emb + {ling.shape[1]} linguistic)")
 
-    # Regularized config — shallow trees + heavy subsampling + L1/L2 to curb the
-    # overfitting that a single 80/20 split on 83 rows masks. The factory returns
-    # a fresh estimator for each CV fold and for the final fit.
+    # Regularized config to curb overfitting on the small (83-row) dataset.
     def make_clf():
         return xgb.XGBClassifier(
             n_estimators=200,
@@ -175,8 +171,6 @@ def main() -> None:
         )
 
     # ── stratified k-fold cross-validation (honest generalization estimate) ────
-    # cross_val_predict trains on N-1 folds and predicts the held-out fold, so
-    # every row gets an out-of-fold prediction it never trained on.
     print(f"\nRunning {N_FOLDS}-fold stratified cross-validation …")
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     oof_pred = cross_val_predict(make_clf(), X, y, cv=skf)
@@ -198,20 +192,15 @@ def main() -> None:
     clf = make_clf()
     clf.fit(X, y)
 
-    # Native model for the local Streamlit app (loaded via xgboost).
     clf.save_model(ROOT_OUT)
     print(f"Saved native XGBoost model to '{ROOT_OUT}'.")
 
-    # Export the trees to JSON for the pure-Python evaluator (api/model_predict.py).
-    # This removes xgboost/scipy/numpy (~500 MB) from the Vercel deployment.
     export_trees_json(clf, TREES_OUT)
     print(f"Exported trees to '{TREES_OUT}'.")
 
     # Sanity check: pure-Python evaluator must match xgboost's own probability.
     import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "model_predict", "api/model_predict.py"
-    )
+    spec = importlib.util.spec_from_file_location("model_predict", "model_predict.py")
     mp = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mp)
     x0 = X[0].tolist()
@@ -223,7 +212,7 @@ def main() -> None:
     print(
         "\nNext steps:\n"
         "  • Local:  streamlit run app.py\n"
-        "  • Vercel: commit api/model_trees.json and redeploy."
+        "  • Vercel: commit model_trees.json and redeploy."
     )
 
 
