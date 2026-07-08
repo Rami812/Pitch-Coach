@@ -59,7 +59,7 @@ st.markdown(
 1. Upload an audio recording of your pitch (WAV, MP3, M4A, OGG, FLAC)
 2. Whisper transcribes it automatically
 3. An XGBoost model (BERT embeddings + linguistic features) scores it *good* or *bad*
-4. (Optional) Gemini gives you actionable coaching feedback
+4. (Optional) Gemini explains the result and gives coaching feedback
 """
 )
 st.divider()
